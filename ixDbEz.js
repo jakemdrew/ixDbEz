@@ -9,6 +9,18 @@
 //
 //Created By - Jake Drew 
 //Version -    1.0, 07/16/2012
+//Version -    2.0, 08/11/2012
+//                  1.  Added Support for ixDbSync.
+//                  2.  Made all error messages consistent, fixed error event capture.
+//                  3.  Updated all data change functions to detect the IndexedDB API versionchange
+//                      transaction and re-schedule themselves for the oncomplete event in the event that
+//                      they are called during the version change transaction.   
+//                  4.  Added clear() function for the IndexedDB API clear method.
+//                  5.  Added keyRange variable to getCursor() function to support IDBKeyRanges.
+//                  6.  Added objectContainsProperty method to identify, if an object contains a property
+//                      prior to adding the property to the object (used in ixDbEz and ixDbEzSync)
+//                  7.  indexName was added to getCursor() function to provide support for opening index
+//                      based cursors.
 //*********************************************************************************************************
 var ixDbEz = (function () {
     //Populate the window.indexedDB variables with the appropriate browser specific instance.  
@@ -19,24 +31,34 @@ var ixDbEz = (function () {
     var ixDb; //The current ixdb database instance being accessed in all functions below.
     var ixDbRequest; //The current ixdb request instance being accessed in all functions below.
     var ixDbVersionTansaction; //Holds a reference to a versionchange transaction object anytime a version change is in process.
-
+    var ixDbVersionRequest;
+    var ixDbSyncFlag;
     //*********************************************************************************************************
     //Function StartDB - Open or create the requested database and populate the variable ixDb with the new IndexedDB instance.
-    //           dbName - Name of the IndexedDB database to open or create
-    //        dbVersion - MUST be a valid integer. If not, the database is given a version number = 1.
-    //          ixdbDDL - javascript var that contains a function with all the IndexedDB's valid ixDbEz DDL calls (see usage example)
-    //        onSuccess - (optional) callback function to execute if function successful.
-    //          onError - (optional) callback function to execute if function fails.
+    //          dbName - Name of the IndexedDB database to open or create
+    //       dbVersion - MUST be a valid integer. If not, the database is given a version number = 1.
+    //         ixdbDDL - javascript var that contains a function with all the IndexedDB's valid ixDbEz DDL calls (see usage example)
+    //       onSuccess - (optional) callback function to execute if function successful.
+    //         onError - (optional) callback function to execute if function fails.
+    //        ixDbSync - (optional) if true, fires ixDbSync events on all datachanges. 
+    //                   !!!only use the ixDbSync option for ixDbSync.js data server-side synchronization!!!
     //*********************************************************************************************************
-    function StartDB_(dbName, dbVersion, ixdbDDL, onSuccess, onError) {
+    function StartDB_(dbName, dbVersion, ixdbDDL, onSuccess, onError, useIxDbSync) {
         //Check to see if we have a browser that supports IndexedDB
         if (window.indexedDB) {
 
+            //Trigger data synchronization hooks, if ixDbSync is being used.
+            ixDbSyncFlag = useIxDbSync;
+            //Open or create the requested IndexedDB Database
             ixDbRequest = window.indexedDB.open(dbName, dbVersion);
 
-            ixDbRequest.onsuccess = function (e) {
-                ixDb = ixDbRequest.result || e.result;  // FF4 requires e.result.
+            var newVersion = parseInt(dbVersion || 1);
+            newVersion = isNaN(newVersion) || newVersion == null ? 1 : newVersion;
 
+            ixDbRequest.onsuccess = function (e) {
+
+                ixDb = ixDbRequest.result || e.result;  // FF4 requires e.result.
+                
                 //Check to see if a database upgrade is required.
                 //This logic should work with Chrome until they catch up with Firefox and support onupgradeneeded event. 
                 //Also works on older browsers builds that still support setVersion
@@ -44,21 +66,29 @@ var ixDbEz = (function () {
 
                     var oldVersion = parseInt(ixDb.version || -1001);
                     oldVersion = isNaN(oldVersion) || oldVersion == null ? -1001 : oldVersion;
-                    var newVersion = parseInt(dbVersion || 1);
-                    newVersion = isNaN(newVersion) || newVersion == null ? 1 : newVersion;
-
+                    
                     if (oldVersion < newVersion) {
-                        var verRequest = ixDb.setVersion(newVersion);
+                        ixDbVersionRequest = ixDb.setVersion(newVersion);
+                        //Get a reference to the version request from the old setVersion method.
+                        //ixDbVersionRequest = verRequest; //.result || e.currentTarget.result;
+                                                                       
+                        ixDbVersionRequest.onerror = ixDbEz.onerror;
 
-                        verRequest.onerror = ixDbEz.onerror;
-
-                        verRequest.onsuccess = function (e) {
+                        ixDbVersionRequest.onsuccess = function (e) {
+                            ixDbVersionTansaction = e.result || e.currentTarget.result;
                             //log successful database creation
-                            console.log('ixDbEz: Created Database: ' + dbName + ',  Version: ' + newVersion + '.')
-                            //Get a reference to the version transaction from the old setVersion method.
-                            ixDbVersionTansaction = verRequest.result;
-                            //Create database using function provided by the user. 
+                            console.log('ixDbEz: Created Database: ' + dbName + ',  Version: ' + newVersion + '.');
+                            //Create database structure using function provided by the user. 
                             ixdbDDL();
+                            //Create any required ixDbSync database structures
+                            if(ixDbSyncFlag) {
+                                ixDbSync.syncDDL();    
+                            } 
+
+                            //must clear version request so getCursor callback works right after db creation
+                            ixDbVersionRequest = undefined; 
+                            //destroy the version trasaction variable (since version change transactions lock the database)
+                            ixDbVersionTansaction = undefined;
                         }
                     }
                     else {
@@ -66,9 +96,6 @@ var ixDbEz = (function () {
                         console.log('ixDbEz: Opened Database: ' + dbName + ',  Version: ' + newVersion + '.')
                     }
                 }
-                
-                //destroy the version trasaction variable (since version change transactions lock the database)
-                delete ixDbVersionTansaction;
 
                 //execute onsuccess function, if one was provided 
                 if(typeof onSuccess === 'function') { 
@@ -79,6 +106,7 @@ var ixDbEz = (function () {
 
             ixDbRequest.onerror = function (e) {
                 logError(e, onError, ixDbVersionTansaction);
+                console.log('ixDbEz Error: Opened Database: ' + dbName + ',  Version: ' + newVersion + ' failed.')
             };
 
             //The onupgradeneeded event is not yet supported by Chrome and requires a hook in the onsuccess event above.
@@ -86,11 +114,24 @@ var ixDbEz = (function () {
                 //FF uses this event to fire DDL function for upgrades.  All browsers will eventually use this method. Per - W3C Working Draft 24 May 2012
                 ixDb = ixDbRequest.result || e.currentTarget.result;
                 //Get a reference to the version transaction via the onupgradeneeded event (e)
-                ixDbVersionTansaction = e.currentTarget.transaction;
+                ixDbVersionTansaction = e.transaction || e.currentTarget.transaction;
+                
+                //Clear out upgrade flags as soon as the upgrade is completed.
+                ixDbVersionTansaction.oncomplete = function (e) {
+                    //must clear version request so getCursor callback works right after db creation
+                    ixDbVersionRequest = undefined; 
+                    //destroy the version trasaction variable (since version change transactions lock the database)
+                    ixDbVersionTansaction = undefined; 
+                };
+
+                //log successful database creation
+                console.log('ixDbEz: Created Database: ' + dbName + ',  Version: ' + newVersion + '.');
                 //Create database using function provided by the user.
                 ixdbDDL();
-                //destroy the version trasaction variable (since version change transactions lock the database)
-                delete ixDbVersionTansaction;
+                //Create any required ixDbSync database structures
+                if(ixDbSyncFlag) {
+                    ixDbSync.syncDDL();    
+                }
             };
         }
     }
@@ -100,29 +141,27 @@ var ixDbEz = (function () {
     //       objectStoreName - Name of the Object Store / Table "MyOsName"
     //                 pkName - Keypath name (Similar to Primary Key)
     //          autoIncrement - true or false (assigns an autonumber to the primary key / Keypath value)
-    //                          Default value = false.
-    //        onSuccess - (optional) callback function to execute if function successful.
-    //          onError - (optional) callback function to execute if function fails. 
+    //                          Default value = false. 
+    //               skipSync - (optional) If true, skips all data synchronization in ixDbSync for a single transaction. 
     //*********************************************************************************************************
-    function CreateObjStore_(objectStoreName, pkName, autoIncrement, onSuccess, onError) {
+    function CreateObjStore_(objectStoreName, pkName, autoIncrement, skipSync) {
         //Create a default value for the autoIncrement variable
         autoIncrement = typeof autoIncrement === 'undefined' ? false : autoIncrement;
+        var objectStore;
 
         try {
-            if (pkName == null || autoIncrement == null)
-                var objectStore = ixDb.createObjectStore(objectStoreName, null);
-            else
-                var objectStore = ixDb.createObjectStore(objectStoreName, { keyPath: pkName, autoIncrement: autoIncrement });
+            objectStore = ixDb.createObjectStore(objectStoreName, { keyPath: pkName, autoIncrement: autoIncrement });
             
-            //execute onsuccess function, if one was provided 
-            if(typeof onSuccess === 'function') { 
-                    onSuccess(); 
+            //ixDbSync - data sync hook
+            if(ixDbSyncFlag && objectStoreName != "ixDbSync" && skipSync != true) {
+                ixDbSync.createObjStoreSync(objectStoreName, pkName, autoIncrement);    
             }
 
             //Log os creation. onsuccess does not fire for objectStore!
             console.log('ixDbEz: Created ObjectStore ' + objectStoreName + '.');
         } catch (e) {
-            logError(e, onError, ixDbVersionTansaction);
+            logError(e);
+            console.log('ixDbEz Error: Create ObjectStore ' + objectStoreName + ' failed.');
         }
         return objectStore;
     }
@@ -136,11 +175,9 @@ var ixDbEz = (function () {
     //                       Default value = false.
     //          multiEntry - true or false, see w3 documentation: http://www.w3.org/TR/IndexedDB/#dfn-multientry
     //                       Default value = false.
-    //        onSuccess - (optional) callback function to execute if function successful.
-    //          onError - (optional) callback function to execute if function fails.
+    //            skipSync - (optional) If true, skips all data synchronization in ixDbSync for a single transaction.
     //*********************************************************************************************************
-    function CreateIndex_(objectStoreName, ixName, fieldName, unique, multiEntry, onSuccess, onError) {
-
+    function CreateIndex_(objectStoreName, ixName, fieldName, unique, multiEntry, skipSync) {
         //Create a default value for the autoIncrement variable
         unique = typeof unique === 'undefined' ? false : unique;
         multiEntry = typeof multiEntry === 'undefined' ? false : multiEntry;
@@ -149,15 +186,16 @@ var ixDbEz = (function () {
             var ObjectStore = ixDbVersionTansaction.objectStore(objectStoreName);
             var index = ObjectStore.createIndex(ixName, fieldName, { unique: unique, multiEntry: multiEntry });
 
-            //execute onsuccess function, if one was provided 
-            if(typeof onSuccess === 'function') { 
-                    onSuccess(); 
+            //ixDbSync - data sync hook
+            if(ixDbSyncFlag && objectStoreName != "ixDbSync" && skipSync != true) {
+                ixDbSync.createIndexSync(objectStoreName, ixName, fieldName, unique, multiEntry);    
             }
 
             //Log index creation. onsuccess does not fire for index!
             console.log('ixDbEz: Created index: ' + ixName + ' against keypath: ' + fieldName + '.');
         } catch (e) {
-            logError(e, onError, ixDbVersionTansaction);
+            logError(e);
+            console.log('ixDbEz Error: Created index - ' + ixName + ' failed.');
         }
     }
 
@@ -168,32 +206,90 @@ var ixDbEz = (function () {
     //              key - (optional) Key to access record.
     //        onSuccess - (optional) callback function to execute if function successful.
     //          onError - (optional) callback function to execute if function fails.
+    //         skipSync - (optional) If true, skips all data synchronization in ixDbSync for a single transaction.
     //*********************************************************************************************************
-    function Add_(objectStoreName, value, key, onSuccess, onError) {
+    function Add_(objectStoreName, value, key, onSuccess, onError, skipSync) {
         if (ixDb) {
-            var transaction = ixDb.transaction(objectStoreName, IDBTransaction.READ_WRITE);
-            var objectStore = transaction.objectStore(objectStoreName);
             
+            //The database is being created or upgraded, re-run when completed. 
+            if(ixDbVersionTansaction) {
+                ixDbVersionTansaction.addEventListener ("complete", function() { Add_(objectStoreName, value, key, onSuccess, onError, skipSync); }, false);
+                return;
+            }
+
+            var transaction = ixDb.transaction(objectStoreName, "readwrite" ); //IDBTransaction.READ_WRITE);
+            var objectStore = transaction.objectStore(objectStoreName);
+
             request = typeof key === 'undefined' ? objectStore.add(value) : objectStore.add(value, key);
 
             request.onsuccess = function (e) {    
                 if(typeof onSuccess === 'function') { 
                     onSuccess(); 
                 }
-                console.log('ixDbEz: Created record in ObjectStore ' + objectStoreName + ".");                         
-            };
-         
-            request.onerror = function (e) { 
-                if(typeof onError === 'function') { 
-                    onError(); 
+
+                //ixDbSync - data sync hook
+                if(ixDbSyncFlag && objectStoreName != "ixDbSync" && skipSync != true) {
+                    ixDbSync.addPutSync(objectStoreName, value, key, "Add");    
                 }
-                console.log('ixDbEz Error: Create record in ObjectStore ' + objectStoreName + " failed.");
-                logError(e);
+                
+                console.log('ixDbEz: Created record in ObjectStore: ' + objectStoreName + ".");                         
+            };
+
+
+            request.onerror = function (e) { 
+                logError(e, onError);
+                console.log('ixDbEz Error: Create record in ObjectStore: ' + objectStoreName + " failed.");
             }
         }
         else { 
+            //The database is in the middle of opening 
             if (ixDbRequest) {
-                ixDbRequest.addEventListener ("success", function() { Add_(objectStoreName, value, key, onSuccess, onError); }, false);
+                ixDbRequest.addEventListener ("success", function() { Add_(objectStoreName, value, key, onSuccess, onError, skipSync); }, false);
+            }
+        }
+    }
+
+    //*********************************************************************************************************
+    //Function Clear - Delete all records from an object store.
+    //     onSuccess - (optional) callback function to execute if function successful.
+    //       onError - (optional) callback function to execute if function fails.
+    //      skipSync - (optional) If true, skips all data synchronization in ixDbSync for a single transaction.
+    //*********************************************************************************************************
+    function Clear_(objectStoreName, onSuccess, onError, skipSync) {
+        if (ixDb) {
+            //The database is being created or upgraded, re-run when completed. 
+            if(ixDbVersionTansaction) {
+                 ixDbVersionTansaction.addEventListener ("complete", function() { Clear_(objectStoreName, onSuccess, onError, skipSync) }, false);
+                return;
+            }
+            
+            var transaction = ixDb.transaction(objectStoreName, "readwrite"); // IDBTransaction.READ_WRITE);
+            var objectStore = transaction.objectStore(objectStoreName);
+
+            var request = objectStore.clear();
+
+            request.onsuccess = function (e) {    
+                if(typeof onSuccess === 'function') { 
+                    onSuccess(); 
+                }
+
+                //ixDbSync - data sync hook
+                if(ixDbSyncFlag && objectStoreName != "ixDbSync" && skipSync != true) {
+                    ixDbSync.clearSync(objectStoreName);    
+                }
+                
+                console.log('ixDbEz: Deleted all records from ObjectStore ' + objectStoreName + ".");                         
+            };
+         
+            request.onerror = function (e) { 
+                logError(e, onError);
+                console.log('ixDbEz Error: Clear ObjectStore: ' + objectStoreName + " failed.");
+            }
+        }
+        else { 
+            //The database is in the middle of opening 
+            if (ixDbRequest) {
+                ixDbRequest.addEventListener ("success", function() { Clear_(objectStoreName, onSuccess, onError, skipSync) }, false);
             }
         }
     }
@@ -205,32 +301,45 @@ var ixDbEz = (function () {
     //              key - (optional) Key to access record.
     //        onSuccess - (optional) callback function to execute if function successful.
     //          onError - (optional) callback function to execute if function fails.
+    //         skipSync - (optional) If true, skips all data synchronization in ixDbSync for a single transaction.
     //*********************************************************************************************************
-    function Put_(objectStoreName, value, key, onSuccess, onError) {
+    function Put_(objectStoreName, value, key, onSuccess, onError, skipSync) {
         if (ixDb) {
-            var transaction = ixDb.transaction(objectStoreName, IDBTransaction.READ_WRITE);
-            var objectStore = transaction.objectStore(objectStoreName);
             
-            request = typeof key === 'undefined' ? objectStore.put(value) : objectStore.put(value, key);
+            //The database is being created or upgraded, re-run when completed. 
+            if(ixDbVersionTansaction) {
+                 ixDbVersionTansaction.addEventListener ("complete", function() { Put_(objectStoreName, value, key, onSuccess, onError, skipSync); }, false);
+                return;
+            }
+            
+            var transaction = ixDb.transaction(objectStoreName, "readwrite"); //IDBTransaction.READ_WRITE);
+            var objectStore = transaction.objectStore(objectStoreName);
 
+            var request = typeof key === 'undefined' ? objectStore.put(value) : objectStore.put(value, key);
+            
             request.onsuccess = function (e) {
                 if(typeof onSuccess === 'function') { 
                     onSuccess(); 
                 }
+
+                //ixDbSync - data sync hook
+                if(ixDbSyncFlag && objectStoreName != "ixDbSync" && skipSync != true) {
+                    //Pass the primary key value to ixDbSync for the server lastUpdateLog 
+                    var logKey = typeof key === 'undefined' ? value[objectStore.keyPath] : key; 
+                    ixDbSync.addPutSync(objectStoreName, value, key, "Put", logKey);    
+                }
+
                 console.log('ixDbEz: Put record into ObjectStore ' + objectStoreName + ".");                        
             };
 
             request.onerror = function (e) { 
-                if(typeof onError === 'function') { 
-                    onError(); 
-                }
+                logError(e, onError);
                 console.log('ixDbEz Error: Put record into ObjectStore ' + objectStoreName + " failed."); 
-                logError(e);
             }
         }
         else {
             if (ixDbRequest) {
-                ixDbRequest.addEventListener ("success", function() { Put_(objectStoreName, value, key, onSuccess, onError); }, false);
+                ixDbRequest.addEventListener ("success", function() { Put_(objectStoreName, value, key, onSuccess, onError, skipSync); }, false);
             }
         }
     }
@@ -242,13 +351,21 @@ var ixDbEz = (function () {
     //            newKey - New value for the oldKey.
     //         onSuccess - (optional) callback function to execute if function successful.
     //           onError - (optional) callback function to execute if function fails.
+    //          skipSync - (optional) If true, skips all data synchronization in ixDbSync for a single transaction.
     //
     //   newKey Warning! - If newKey exists in the ObjectStore, it's value will be replaced by oldKey.value
     //*********************************************************************************************************
-    function UpdateKey_(objectStoreName, oldKey, newKey, onSuccess, onError) {
+    function UpdateKey_(objectStoreName, oldKey, newKey, onSuccess, onError, skipSync) {
         if (ixDb) {
+            
+            //The database is being created or upgraded, re-run when completed. 
+            if(ixDbVersionTansaction) {
+                 ixDbVersionTansaction.addEventListener ("complete", function() { UpdateKey_(objectStoreName, oldKey, newKey, onSuccess, onError, skipSync); }, false);
+                return;
+            }
+            
             var keyInObject = false;
-            var transaction = ixDb.transaction(objectStoreName, IDBTransaction.READ_WRITE);
+            var transaction = ixDb.transaction(objectStoreName, "readwrite"); // IDBTransaction.READ_WRITE);
             var objectStore = transaction.objectStore(objectStoreName);
 
             //Check oldKey exists request
@@ -267,7 +384,7 @@ var ixDbEz = (function () {
                     //if the value in the oldKey record is an object, and that object contains a 
                     //property that matches the current ObjectStore's KeyPath name, update that property 
                     //with the newKey value.
-                    if(typeof oldKeyResult === 'object' && containsProperty(oldKeyResult, objectStore.keyPath)){
+                    if(typeof oldKeyResult === 'object' && objectContainsProperty_(oldKeyResult, objectStore.keyPath)){
                         oldKeyResult[objectStore.keyPath] = newKey;
                         //since the newKey was updated in the object, newKey variable must = undefined
                         //or add_ and put_ will fail. keyInObject is checked later to set newKey = undefined
@@ -276,6 +393,11 @@ var ixDbEz = (function () {
 
                     //delete oldKey request
                     var request = objectStore.delete(oldKey);
+
+                    //ixDbSync - data sync hook for above delete operation
+                    if(ixDbSyncFlag && objectStoreName != "ixDbSync" && skipSync != true) {
+                        ixDbSync.deleteSync(objectStoreName, oldKey);    
+                    }
 
                     request.onsuccess = function (e) {
                         
@@ -288,19 +410,19 @@ var ixDbEz = (function () {
                             //newKey provided does not exist in database, so a new record is added
                             if(typeof newKeyResult === 'undefined'){
                                 if(keyInObject){
-                                    Add_(objectStoreName, oldKeyResult, undefined , onSuccess, onError);
+                                    Add_(objectStoreName, oldKeyResult, undefined , onSuccess, onError, skipSync);
                                 }
                                 else{
-                                    Add_(objectStoreName, oldKeyResult, newKey, onSuccess, onError);
+                                    Add_(objectStoreName, oldKeyResult, newKey, onSuccess, onError, skipSync);
                                 }    
                             }
                             //newKey does exist in database, and it's value is replaced.
                             else {
                                 if(keyInObject){
-                                    Put_(objectStoreName, oldKeyResult, undefined , onSuccess, onError);
+                                    Put_(objectStoreName, oldKeyResult, undefined , onSuccess, onError, skipSync);
                                 }
                                 else{
-                                    Put_(objectStoreName, oldKeyResult, newKey, onSuccess, onError);
+                                    Put_(objectStoreName, oldKeyResult, newKey, onSuccess, onError, skipSync);
                                 } 
                             } //else - newKey exists
                         } //check newKey.onsuccess 
@@ -335,7 +457,7 @@ var ixDbEz = (function () {
         } // ixDb exists
         else{
             if (ixDbRequest) {
-                ixDbRequest.addEventListener ("success", function() { UpdateKey_(objectStoreName, oldKey, newKey, onSuccess, onError); }, false);
+                ixDbRequest.addEventListener ("success", function() { UpdateKey_(objectStoreName, oldKey, newKey, onSuccess, onError, skipSync); }, false);
             }
         }
     } // function
@@ -346,10 +468,18 @@ var ixDbEz = (function () {
     //              key - Key of the record to be deleted.
     //        onSuccess - (optional) callback function to execute if function successful.
     //          onError - (optional) callback function to execute if function fails.
+    //         skipSync - (optional) If true, skips all data synchronization in ixDbSync for a single transaction.
     //*********************************************************************************************************
-    function Delete_(objectStoreName, key, onSuccess, onError) {
+    function Delete_(objectStoreName, key, onSuccess, onError, skipSync) {
         if (ixDb) {
-            var transaction = ixDb.transaction(objectStoreName, IDBTransaction.READ_WRITE);
+            
+            //The database is being created or upgraded, re-run when completed. 
+            if(ixDbVersionTansaction) {
+                 ixDbVersionTansaction.addEventListener ("complete", function() { Delete_(objectStoreName, key, onSuccess, onError, skipSync); }, false);
+                return;
+            }
+            
+            var transaction = ixDb.transaction(objectStoreName, "readwrite"); // IDBTransaction.READ_WRITE);
             var objectStore = transaction.objectStore(objectStoreName);
 
             request = objectStore.delete(key);
@@ -358,20 +488,24 @@ var ixDbEz = (function () {
                 if(typeof onSuccess === 'function') { 
                     onSuccess(); 
                 }
+
+                //ixDbSync - data sync hook
+                if(ixDbSyncFlag && objectStoreName != "ixDbSync" && skipSync != true) {
+                    ixDbSync.deleteSync(objectStoreName, key);    
+                }
+
                 console.log('ixDbEz: Deleted record key: ' + key + ' from ObjectStore ' + objectStoreName + ".");                          
             };
 
             request.onerror = function (e) { 
-                if(typeof onError === 'function') { 
-                    onError(); 
-                }
-                console.log('ixDbEz: Deleted record key: ' + key + ' from ObjectStore ' + objectStoreName + " failed."); 
-                logError(e);
+                var errEvent = e.result||this.result;
+                logError(errEvent, onError);
+                console.log('ixDbEz Error: Deleted record key: ' + key + ' from ObjectStore ' + objectStoreName + " failed."); 
             }
         }
         else{
             if (ixDbRequest) {
-                ixDbRequest.addEventListener ("success", function() { Delete_(objectStoreName, key, onSuccess, onError); }, false);
+                ixDbRequest.addEventListener ("success", function() { Delete_(objectStoreName, key, onSuccess, onError, skipSync); }, false);
             }
         }
     }
@@ -382,8 +516,11 @@ var ixDbEz = (function () {
     //         onSuccess - Name of the function to call and pass the cursor request back to upon 
     //                      successful completion.
     //           onError - (optional) callback function to execute if function fails. 
-    // 
-    //     onSuccess Ex. - getCursor_("ObjectStore_Name", MyCallBackFunction);
+    //          keyRange - (optional) IDBKeyRange to use when getting the cursor.
+    //         readWrite - (optional) If set to true, returns a readwrite cursor.
+    //         indexName - (optional) Name of a valid objectStore index.  If provided, the cursor is opened
+    //                                using the requested indexName.
+    //     onSuccess Ex. - getCursor_("ObjectStore_Name", MyCallBackFunction) 
     //                      !! onSuccess function definition must have input variable for the request object !!
     //  
     //                      Function MyCallBackFunction(CursorRequestObj) { 
@@ -391,20 +528,47 @@ var ixDbEz = (function () {
     //                      }
     //
     //*********************************************************************************************************
-    function getCursor_(objectStoreName, onSuccess, onError) {
+    function getCursor_(objectStoreName, onSuccess, onError, keyRange, readWrite, indexName) {
         //The the openCursor call is asynchronous, so we must check to ensure a database 
         //connection has been established and then provide the cursor via callback. 
         if (ixDb) {
-            var transaction = ixDb.transaction(objectStoreName, IDBTransaction.READ_ONLY);
-            var objectStore = transaction.objectStore(objectStoreName); 
-            try{
-                var request = objectStore.openCursor(); 
-                onSuccess(request);
-                console.log('ixDbEz: Getting cursor request for ' + objectStoreName + ".");
-            }
-            catch(e){
-                onError();
-                console.log('ixDbEz Error' + ' getCursor:(' + e.code + '): ' + e.message);
+                //If the database is in the middle of an upgrade, return an undefined cursor.
+                if(ixDbVersionTansaction || ixDbVersionRequest) {
+                    onSuccess();
+                }
+                else
+                { 
+                try{
+                    var transaction;
+                    if(readWrite == true) {
+                        transaction = ixDb.transaction(objectStoreName, "readwrite"); // IDBTransaction.READ_ONLY);
+                    }
+                    else{
+                        transaction = ixDb.transaction(objectStoreName, "readonly");
+                    }
+                    
+                    var objectStore = transaction.objectStore(objectStoreName);
+                    
+                    //If an indexName is provided, the cursor is opened using the requested index
+                    //Otherwise it is opened via the object store. In either case, cursor is opened using 
+                    //a keyRange, if one is provided.
+                    var cursor;
+                    if(typeof indexName === "undefined") {
+                        cursor = typeof keyRange === "undefined" ? objectStore.openCursor() : objectStore.openCursor(keyRange);
+                    }
+                    else {
+                        var index = objectStore.index(indexName);
+                        cursor = typeof keyRange === "undefined" ? index.openCursor() : index.openCursor(keyRange);
+                    }
+
+                    //Return the requested cursor via the callback function provided by the user.
+                    onSuccess(cursor);
+                    console.log('ixDbEz: Getting cursor request for ' + objectStoreName + ".");
+                }
+                catch(e){
+                    logError(e, onError);
+                    console.log('ixDbEz Error: getCursor failed');
+                }
             } 
         }
         else { 
@@ -414,16 +578,28 @@ var ixDbEz = (function () {
         }
     }
     
+    //*********************************************************************************************************
+    //Function objectContainsProperty - Returns true if the object contains the requested property, otherwise false. 
+    //                         object - A valid javascript object.
+    //                       property - A string with the requested property name.
+    //*********************************************************************************************************
+    function objectContainsProperty_(object, property){
+        var prototype = object.__prototype__ || object.constructor.prototype;
+        return (property in object) && (!(property in prototype) 
+             || prototype[property] !== object[property]);
+    }
 
     return {
         startDB: StartDB_,
         createObjStore: CreateObjStore_,
         createIndex: CreateIndex_,
         add : Add_,
+        clear: Clear_,
         put : Put_,
         delete : Delete_,
         getCursor: getCursor_, 
-        updateKey : UpdateKey_
+        updateKey : UpdateKey_,
+        objectContainsProperty: objectContainsProperty_
     }
 })();
 
@@ -444,20 +620,11 @@ function logError(errEvent, onError, transaction) {
     if(typeof onError === 'function') { 
         onError(); 
     }
+    
     //if a transaction object was passed, attempt to abort it
-    if(transaction.constructor.name == "IDBTransaction") { 
+    if(typeof transaction !== 'undefined' && transaction.constructor.name == "IDBTransaction") { 
         transaction.abort();
     }
-    console.log('ixDbEz Error' + '(' + errEvent.code + '): ' + errEvent.message + '.');
-}
 
-//*********************************************************************************************************
-//Function containsProperty - Returns true if the object contains the requested property, otherwise false. 
-//                   object - A valid javascript object.
-//                 property - A string with the requested property name.
-//*********************************************************************************************************
-function containsProperty(object, property){
-    var prototype = object.__prototype__ || object.constructor.prototype;
-    return (property in object) && (!(property in prototype) 
-         || prototype[property] !== object[property]);
+    console.log('ixDbEz Error' + '(' + errEvent.code + '): ' + errEvent.message + '.');
 }
